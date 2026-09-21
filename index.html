@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fireworks Simulator</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    * {
+      box-sizing: border-box;
+      user-select: none;
+    }
+
+    body {
+      margin: 0;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif;
+      background: #03030a;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      touch-action: none;
+      cursor: crosshair;
+    }
+
+    .panel {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      width: min(320px, calc(100vw - 24px));
+      padding: 12px;
+      border-radius: 10px;
+      background: rgba(10, 10, 20, 0.8);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      backdrop-filter: blur(2px);
+      color: #dbe8ff;
+      font-size: 13px;
+    }
+
+    .panel h1 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.2px;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .row:last-child {
+      margin-bottom: 0;
+    }
+
+    label {
+      opacity: 0.95;
+    }
+
+    input[type="range"],
+    input[type="number"],
+    select,
+    button {
+      width: 100%;
+      background: rgba(24, 24, 38, 0.95);
+      color: #e8f0ff;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 6px;
+      padding: 5px 7px;
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    .row.controls {
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .stat {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: rgba(8, 8, 16, 0.72);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: #d5e4ff;
+      font-size: 12px;
+      min-width: 130px;
+      line-height: 1.4;
+      letter-spacing: 0.2px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+
+  <!--
+    Particle system architecture:
+    - Rockets are separate state objects that spawn at the bottom and travel toward a target point
+      with slight gravity/arc, carrying their own short trail history.
+    - When a rocket reaches its destination criteria, it is removed and replaced by explosion particles.
+    - Explosion particles track velocity, alpha, and trail points; burst generators create three shape
+      families (sphere, ring, willow) and assign a 2-3 color palette per burst.
+    - Render loop updates/draws rockets and particles every frame, applies global canvas fade for smooth
+      trails, and prunes fully faded particles to keep memory/performance bounded.
+  -->
+
+  <div class="panel" aria-label="Fireworks controls">
+    <h1>Fireworks Controls</h1>
+
+    <div class="row">
+      <label for="particleCount">Particles</label>
+      <input id="particleCount" type="number" min="30" max="100" value="70" />
+    </div>
+
+    <div class="row">
+      <label for="gravity">Gravity</label>
+      <input id="gravity" type="range" min="0.02" max="0.22" step="0.005" value="0.08" />
+    </div>
+
+    <div class="row">
+      <label for="fadeSpeed">Fade Speed</label>
+      <input id="fadeSpeed" type="range" min="0.004" max="0.035" step="0.001" value="0.014" />
+    </div>
+
+    <div class="row">
+      <label for="shape">Burst Shape</label>
+      <select id="shape">
+        <option value="random" selected>Random</option>
+        <option value="sphere">Sphere</option>
+        <option value="ring">Ring</option>
+        <option value="willow">Willow</option>
+      </select>
+    </div>
+
+    <div class="row controls">
+      <button id="autoToggle" type="button" aria-pressed="false">Auto Show: Off</button>
+      <button id="clearBtn" type="button">Clear</button>
+    </div>
+  </div>
+
+  <div class="stat" id="stats">FPS: --<br/>Particles: 0</div>
+
+  <script>
+    const canvas = document.getElementById('scene');
+    const ctx = canvas.getContext('2d');
+
+    const particleCountInput = document.getElementById('particleCount');
+    const gravityInput = document.getElementById('gravity');
+    const fadeSpeedInput = document.getElementById('fadeSpeed');
+    const shapeInput = document.getElementById('shape');
+    const autoToggleButton = document.getElementById('autoToggle');
+    const clearButton = document.getElementById('clearBtn');
+    const stats = document.getElementById('stats');
+
+    const MAX_PARTICLES = 2000;
+    const ROCKET_SPEED_RANGE = [8.5, 12.5];
+    const colors = ['#ff3366', '#ff9933', '#ffee55', '#66ddff', '#66ff99', '#c987ff', '#ffffff'];
+
+    const rockets = [];
+    const particles = [];
+
+    let width = 0;
+    let height = 0;
+    let dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    let pointerDown = false;
+    let pointerX = 0;
+    let pointerY = 0;
+    let dragLaunchTimer = 0;
+
+    let autoShow = false;
+    let autoShowTimer = 0;
+
+    let fps = 0;
+    let frameCounter = 0;
+    let fpsTimer = 0;
+
+    function resize() {
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      width = window.innerWidth;
+      height = window.innerHeight;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      drawBackground();
+    }
+
+    function drawBackground() {
+      const grad = ctx.createLinearGradient(0, 0, 0, height);
+      grad.addColorStop(0, '#03030a');
+      grad.addColorStop(1, '#070714');
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, width, height);
+    }
+
+    class Rocket {
+      constructor(targetX, targetY) {
+        const startX = clamp(targetX + randRange(-90, 90), 20, width - 20);
+        this.x = startX;
+        this.y = height + 12;
+        this.targetX = clamp(targetX, 12, width - 12);
+        this.targetY = clamp(targetY, 24, height * 0.86);
+
+        const dx = this.targetX - this.x;
+        const dy = this.targetY - this.y;
+        const dist = Math.max(Math.hypot(dx, dy), 1);
+        const speed = randRange(ROCKET_SPEED_RANGE[0], ROCKET_SPEED_RANGE[1]);
+
+        this.vx = (dx / dist) * speed;
+        this.vy = (dy / dist) * speed;
+        this.gravity = 0.035;
+        this.trail = [];
+        this.life = 0;
+        this.maxLife = Math.max(24, dist / speed + 8);
+      }
+
+      update(dt) {
+        this.life += dt;
+        this.trail.push({ x: this.x, y: this.y });
+        if (this.trail.length > 14) this.trail.shift();
+
+        this.vy += this.gravity * dt;
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+
+        const closeToTarget = Math.hypot(this.x - this.targetX, this.y - this.targetY) < 20;
+        const passedApex = this.vy > 0 && this.y < this.targetY + 25;
+        return closeToTarget || passedApex || this.life > this.maxLife;
+      }
+
+      draw() {
+        if (this.trail.length > 1) {
+          ctx.beginPath();
+          for (let i = 0; i < this.trail.length; i += 1) {
+            const p = this.trail[i];
+            if (i === 0) ctx.moveTo(p.x, p.y);
+            else ctx.lineTo(p.x, p.y);
+          }
+          ctx.strokeStyle = 'rgba(255, 220, 180, 0.35)';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, 2.4, 0, Math.PI * 2);
+        ctx.fillStyle = '#fff7d6';
+        ctx.shadowBlur = 14;
+        ctx.shadowColor = '#ffcc88';
+        ctx.fill();
+      }
+    }
+
+    class Particle {
+      constructor(x, y, vx, vy, color, lifeBias, burstType) {
+        this.x = x;
+        this.y = y;
+        this.vx = vx;
+        this.vy = vy;
+        this.color = color;
+        this.alpha = 1;
+        this.size = randRange(1.5, 2.8);
+        this.drag = burstType === 'willow' ? 0.985 : 0.992;
+        this.lifeBias = lifeBias;
+        this.burstType = burstType;
+        this.trail = [];
+      }
+
+      update(dt, gravity, fadeSpeed) {
+        this.trail.push({ x: this.x, y: this.y });
+        const trailLimit = this.burstType === 'willow' ? 14 : 8;
+        if (this.trail.length > trailLimit) this.trail.shift();
+
+        this.vx *= this.drag;
+        this.vy *= this.drag;
+        this.vy += gravity * (this.burstType === 'willow' ? 0.65 : 1) * dt;
+
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+
+        this.alpha -= fadeSpeed * this.lifeBias * dt;
+        return this.alpha <= 0.015;
+      }
+
+      draw() {
+        if (this.trail.length > 1) {
+          ctx.beginPath();
+          for (let i = 0; i < this.trail.length; i += 1) {
+            const p = this.trail[i];
+            if (i === 0) ctx.moveTo(p.x, p.y);
+            else ctx.lineTo(p.x, p.y);
+          }
+          ctx.strokeStyle = rgba(this.color, Math.max(this.alpha * 0.32, 0));
+          ctx.lineWidth = this.burstType === 'willow' ? 1.9 : 1.2;
+          ctx.stroke();
+        }
+
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+        ctx.fillStyle = rgba(this.color, Math.max(this.alpha, 0));
+        ctx.shadowBlur = 16;
+        ctx.shadowColor = this.color;
+        ctx.fill();
+      }
+    }
+
+    function explodeRocket(rocket) {
+      if (particles.length >= MAX_PARTICLES) return;
+
+      const forced = shapeInput.value;
+      const burstType = forced === 'random' ? pick(['sphere', 'ring', 'willow']) : forced;
+      const requestedCount = clamp(parseInt(particleCountInput.value, 10) || 70, 30, 100);
+      const count = Math.min(requestedCount + Math.floor(randRange(-8, 9)), MAX_PARTICLES - particles.length);
+
+      const paletteSize = Math.round(randRange(2, 3));
+      const palette = shuffle([...colors]).slice(0, paletteSize);
+
+      for (let i = 0; i < count; i += 1) {
+        const color = palette[i % palette.length];
+        const params = burstVelocity(burstType, i, count);
+        const lifeBias = burstType === 'willow' ? randRange(0.65, 0.95) : randRange(0.9, 1.2);
+        particles.push(new Particle(rocket.x, rocket.y, params.vx, params.vy, color, lifeBias, burstType));
+      }
+    }
+
+    function burstVelocity(type, i, count) {
+      if (type === 'ring') {
+        const angle = (i / count) * Math.PI * 2 + randRange(-0.08, 0.08);
+        const speed = randRange(3.8, 5.2);
+        return { vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed };
+      }
+
+      if (type === 'willow') {
+        const angle = randRange(0, Math.PI * 2);
+        const speed = randRange(1.2, 2.8);
+        const upBoost = randRange(2.5, 5.2);
+        return { vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed - upBoost };
+      }
+
+      const angle = randRange(0, Math.PI * 2);
+      const speed = randRange(2.4, 6.6);
+      return { vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed };
+    }
+
+    function launchFirework(targetX, targetY) {
+      if (particles.length >= MAX_PARTICLES) return;
+      rockets.push(new Rocket(targetX, targetY));
+    }
+
+    function clearAll() {
+      rockets.length = 0;
+      particles.length = 0;
+      drawBackground();
+    }
+
+    function tickAutoShow(dt, currentFPS) {
+      if (!autoShow) return;
+
+      autoShowTimer -= dt * 16.67;
+      if (autoShowTimer > 0) return;
+
+      const spawnDelay = currentFPS < 30 ? randRange(500, 900) : randRange(180, 420);
+      autoShowTimer = spawnDelay;
+
+      if (particles.length >= MAX_PARTICLES * 0.92) return;
+
+      const tx = randRange(width * 0.1, width * 0.9);
+      const ty = randRange(height * 0.08, height * 0.58);
+      launchFirework(tx, ty);
+    }
+
+    function updateStats() {
+      stats.innerHTML = `FPS: ${fps.toFixed(0)}<br/>Particles: ${particles.length}`;
+    }
+
+    function frame(now) {
+      if (!frame.last) frame.last = now;
+      const dt = Math.min((now - frame.last) / 16.67, 2.5);
+      frame.last = now;
+
+      frameCounter += 1;
+      fpsTimer += now - (fpsTimer.last || now);
+      fpsTimer.last = now;
+      if (fpsTimer >= 250) {
+        fps = (frameCounter * 1000) / fpsTimer;
+        frameCounter = 0;
+        fpsTimer = 0;
+        updateStats();
+      }
+
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(3, 3, 10, 0.2)';
+      ctx.fillRect(0, 0, width, height);
+
+      const gravity = parseFloat(gravityInput.value) || 0.08;
+      const fadeSpeed = parseFloat(fadeSpeedInput.value) || 0.014;
+
+      tickAutoShow(dt, fps || 60);
+
+      if (pointerDown) {
+        dragLaunchTimer -= dt * 16.67;
+        if (dragLaunchTimer <= 0) {
+          launchFirework(pointerX, pointerY);
+          dragLaunchTimer = 90;
+        }
+      }
+
+      for (let i = rockets.length - 1; i >= 0; i -= 1) {
+        const rocket = rockets[i];
+        const shouldExplode = rocket.update(dt);
+        if (shouldExplode) {
+          explodeRocket(rocket);
+          rockets.splice(i, 1);
+        }
+      }
+
+      for (let i = particles.length - 1; i >= 0; i -= 1) {
+        const particle = particles[i];
+        if (particle.update(dt, gravity, fadeSpeed)) {
+          particles.splice(i, 1);
+        }
+      }
+
+      ctx.globalCompositeOperation = 'lighter';
+      for (let i = 0; i < rockets.length; i += 1) {
+        rockets[i].draw();
+      }
+      for (let i = 0; i < particles.length; i += 1) {
+        particles[i].draw();
+      }
+      ctx.globalCompositeOperation = 'source-over';
+
+      requestAnimationFrame(frame);
+    }
+
+    function handlePointerPosition(e) {
+      const rect = canvas.getBoundingClientRect();
+      pointerX = e.clientX - rect.left;
+      pointerY = e.clientY - rect.top;
+    }
+
+    canvas.addEventListener('pointerdown', (e) => {
+      pointerDown = true;
+      handlePointerPosition(e);
+      launchFirework(pointerX, pointerY);
+      dragLaunchTimer = 90;
+      canvas.setPointerCapture(e.pointerId);
+    });
+
+    canvas.addEventListener('pointermove', (e) => {
+      if (!pointerDown) return;
+      handlePointerPosition(e);
+    });
+
+    function stopPointer(e) {
+      pointerDown = false;
+      if (e && canvas.hasPointerCapture(e.pointerId)) {
+        canvas.releasePointerCapture(e.pointerId);
+      }
+    }
+
+    canvas.addEventListener('pointerup', stopPointer);
+    canvas.addEventListener('pointercancel', stopPointer);
+    canvas.addEventListener('pointerleave', stopPointer);
+
+    autoToggleButton.addEventListener('click', () => {
+      autoShow = !autoShow;
+      autoToggleButton.textContent = `Auto Show: ${autoShow ? 'On' : 'Off'}`;
+      autoToggleButton.setAttribute('aria-pressed', String(autoShow));
+      if (autoShow) {
+        autoShowTimer = 0;
+      }
+    });
+
+    clearButton.addEventListener('click', clearAll);
+
+    particleCountInput.addEventListener('change', () => {
+      particleCountInput.value = String(clamp(parseInt(particleCountInput.value, 10) || 70, 30, 100));
+    });
+
+    window.addEventListener('resize', resize);
+
+    function randRange(min, max) {
+      return Math.random() * (max - min) + min;
+    }
+
+    function pick(arr) {
+      return arr[(Math.random() * arr.length) | 0];
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(max, Math.max(min, value));
+    }
+
+    function shuffle(arr) {
+      for (let i = arr.length - 1; i > 0; i -= 1) {
+        const j = (Math.random() * (i + 1)) | 0;
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    }
+
+    function rgba(hex, a) {
+      const clean = hex.replace('#', '');
+      const bigint = parseInt(clean.length === 3
+        ? clean.split('').map((c) => c + c).join('')
+        : clean, 16);
+      const r = (bigint >> 16) & 255;
+      const g = (bigint >> 8) & 255;
+      const b = bigint & 255;
+      return `rgba(${r}, ${g}, ${b}, ${a})`;
+    }
+
+    resize();
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
