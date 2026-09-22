@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fireworks Show</title>
+<style>
+  /* ── Reset & full-screen canvas ─────────────────────────── */
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; }
+
+  /* ── Control Panel ──────────────────────────────────────── */
+  #controls {
+    position: fixed; top: 12px; right: 12px; z-index: 10;
+    background: rgba(8,6,16,.88); color: #ddd;
+    border: 1px solid #444; border-radius: 10px;
+    padding: 14px 18px; font-family: 'Segoe UI', system-ui, sans-serif;
+    font-size: 13px; min-width: 220px; user-select: none;
+    backdrop-filter: blur(10px);
+    box-shadow: 0 4px 20px rgba(0,0,0,.5);
+  }
+  #controls h3 { margin-bottom: 10px; font-size: 15px; color: #fff; }
+  .ctrl-row { margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .ctrl-row label { min-width: 90px; }
+  .ctrl-row input[type=range] { flex: 1; accent-color: #f80; }
+  .ctrl-row select, .ctrl-row button {
+    padding: 4px 8px; border-radius: 4px; border: 1px solid #555;
+    background: #1a1a2a; color: #ddd; cursor: pointer; font-size: 12px;
+  }
+  .ctrl-row button:hover { background: #2a2a3a; }
+  .ctrl-row button.active { background: #f80; color: #000; font-weight: 600; }
+  #stats {
+    position: fixed; bottom: 12px; left: 12px; z-index: 10;
+    color: #888; font-family: monospace; font-size: 12px;
+    background: rgba(0,0,0,.55); padding: 6px 10px; border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+
+<!-- Control Panel -->
+<div id="controls">
+  <h3>🎆 Fireworks</h3>
+  <div class="ctrl-row">
+    <label>Particles:</label>
+    <input type="range" id="pCount" min="10" max="300" value="60">
+    <span id="pCountVal">60</span>
+  </div>
+  <div class="ctrl-row">
+    <label>Gravity:</label>
+    <input type="range" id="gravity" min="1" max="20" value="6">
+    <span id="gravityVal">6</span>
+  </div>
+  <div class="ctrl-row">
+    <label>Fade speed:</label>
+    <input type="range" id="fadeSpeed" min="1" max="20" value="6">
+    <span id="fadeSpeedVal">6</span>
+  </div>
+  <div class="ctrl-row">
+    <label>Burst shape:</label>
+    <select id="burstShape">
+      <option value="random">Random</option>
+      <option value="sphere">Classic Sphere</option>
+      <option value="ring">Ring / Circle</option>
+      <option value="willow">Willow (trail)</option>
+    </select>
+  </div>
+  <div class="ctrl-row">
+    <button id="autoShow">Auto Show: OFF</button>
+    <button id="clearBtn">Clear</button>
+  </div>
+</div>
+
+<!-- FPS / particle count overlay -->
+<div id="stats">FPS: -- | Particles: 0</div>
+
+<!-- Main canvas -->
+<canvas id="canvas"></canvas>
+
+<script>
+// ═══════════════════════════════════════════════════════════
+// FIREWORKS SHOW — Architecture
+// ═══════════════════════════════════════════════════════════
+//
+// 1) Rocket state:
+//    Each rocket is a small bright dot launched from the bottom of the
+//    canvas toward a target click position.  It has position (x,y),
+//    velocity (vx,vy), a short visible trail (array of previous positions),
+//    and a target height.  When the rocket's y reaches the target (or it
+//    slows below a threshold) it is flagged for explosion.
+//
+// 2) Explosion particle state:
+//    On explosion the rocket spawns 30-100 (configurable) particles.
+//    Each particle has position, velocity, color(s), alpha (0-1),
+//    and a burst-shape tag (sphere / ring / willow).  On every frame:
+//      - gravity pulls the particle down (vy += gravity * dt)
+//      - alpha decays by fadeSpeed * dt each frame
+//      - when alpha <= 0 the particle is removed from the active array
+//
+// 3) Burst shapes:
+//    - sphere:  uniform radial distribution, all particles share similar
+//               speed → classic spherical burst.
+//    - ring:    particles placed on a circle (random angle, fixed radius).
+//    - willow:  particles get a slower initial speed + extra drag so they
+//               arc upward then drift downward slowly, leaving long trails.
+//
+// 4) Game loop:
+//    requestAnimationFrame drives the loop.  Each frame:
+//      a) Draw a semi-transparent black rectangle (trail / motion-blur effect)
+//      b) Update all rockets & particles
+//      c) Draw rockets (with trail dots) then particles (additive blending)
+//      d) Remove dead particles / exploded rockets
+//      e) Update stats overlay
+//
+// 5) Safety:
+//    - Total active particles capped at MAX_PARTICLES (3000).  If the cap
+//      is hit, new bursts are skipped to prevent performance collapse.
+//    - FPS is tracked and displayed; auto-show reduces frequency if FPS drops.
+// ═══════════════════════════════════════════════════════════
+
+// ── Canvas setup ───────────────────────────────────────────
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── DOM refs ───────────────────────────────────────────────
+const elPCount     = document.getElementById('pCount');
+const elPCountVal  = document.getElementById('pCountVal');
+const elGravity    = document.getElementById('gravity');
+const elGravityVal = document.getElementById('gravityVal');
+const elFade       = document.getElementById('fadeSpeed');
+const elFadeVal    = document.getElementById('fadeSpeedVal');
+const elBurst      = document.getElementById('burstShape');
+const elAuto       = document.getElementById('autoShow');
+const elClear      = document.getElementById('clearBtn');
+const elStats      = document.getElementById('stats');
+
+// ── Config (read from sliders) ────────────────────────────
+function cfg() {
+  return {
+    particlesPerBurst: +elPCount.value,
+    gravity:           +elGravity.value / 1000,   // scaled to pixel/frame at 60fps
+    fadeSpeed:         +elFade.value / 1000,
+    burstShape:        elBurst.value,             // "random" | "sphere" | "ring" | "willow"
+  };
+}
+
+// Slider live-value display
+elPCount.oninput = () => elPCountVal.textContent = elPCount.value;
+elGravity.oninput = () => elGravityVal.textContent = elGravity.value;
+elFade.oninput  = () => elFadeVal.textContent    = elFade.value;
+
+// ── Constants ──────────────────────────────────────────────
+const MAX_PARTICLES  = 3000;
+const TRAIL_LENGTH   = 10;         // rocket trail dot count (longer = more dramatic)
+const ROCKET_SPEED   = 14;         // initial rocket speed px/frame (faster = more dynamic)
+const BG_FADE_ALPHA  = 0.18;       // how much of each frame is "remembered" (deeper trails)
+
+// ── State ──────────────────────────────────────────────────
+let rockets   = [];   // active rockets
+let particles = [];   // active explosion particles
+let autoOn    = false;
+let autoTimer = 0;
+let lastTime  = 0;
+let fpsAccum  = 0;
+let fpsFrames = 0;
+let fpsValue  = 0;
+
+// ── Utility ────────────────────────────────────────────────
+function rand(a, b) { return a + Math.random() * (b - a); }
+function randInt(a, b) { return Math.floor(rand(a, b + 1)); }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// Generate a random HSL color — warmer, more vibrant palette
+function randomHSL(hueOffset = 0) {
+  const h = (Math.random() * 360 + hueOffset) % 360;
+  // Use very high saturation and bright lightness for vivid colors
+  const s = 95 + Math.random() * 5;  // 95-100% sat
+  const l = 58 + Math.random() * 12;  // 58-70% lightness
+  return `hsl(${h}, ${Math.round(s)}%, ${Math.round(l)}%)`;
+}
+function pickMultiColor() {
+  // Return 1-3 harmonious colors for a multi-color burst
+  const count = Math.random() < 0.4 ? 1 : (Math.random() < 0.6 ? 2 : 3);
+  const baseHue = Math.random() * 360;
+  const colors = [];
+  for (let i = 0; i < count; i++) {
+    // Spread hues harmoniously around the base
+    const h = (baseHue + i * (Math.random() * 60 + 30)) % 360;
+    const s = 95 + Math.random() * 5;
+    const l = 58 + Math.random() * 12;
+    colors.push(`hsl(${Math.round(h)}, ${Math.round(s)}%, ${Math.round(l)}%)`);
+  }
+  return colors;
+}
+
+// ── Rocket class ───────────────────────────────────────────
+class Rocket {
+  constructor(sx, sy, tx, ty) {
+    this.x = sx;
+    this.y = sy;
+    // Direction toward target
+    const dx = tx - sx;
+    const dy = ty - sy;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    this.vx = (dx / dist) * ROCKET_SPEED;
+    this.vy = (dy / dist) * ROCKET_SPEED;
+    this.trail = [];          // previous positions for visual trail
+    this.alive = true;
+    this.targetY = ty;        // explode when we reach near this Y
+  }
+
+  update() {
+    // Store position for trail
+    this.trail.push({ x: this.x, y: this.y });
+    if (this.trail.length > TRAIL_LENGTH) this.trail.shift();
+
+    // Apply slight gravity arc to rocket
+    this.vy += 0.03;
+    this.x += this.vx;
+    this.y += this.vy;
+
+    // Check if rocket reached target or slowed enough
+    const speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
+    const dyDist = this.y - this.targetY;
+    if (this.vy >= 0 || Math.abs(dyDist) < 20 || this.y < this.targetY) {
+      this.alive = false;
+    }
+  }
+
+  draw(ctx) {
+    // Draw trail as a single smooth path (one draw call)
+    if (this.trail.length > 1) {
+      ctx.beginPath();
+      ctx.moveTo(this.trail[0].x, this.trail[0].y);
+      for (let i = 1; i < this.trail.length; i++) {
+        ctx.lineTo(this.trail[i].x, this.trail[i].y);
+      }
+      ctx.strokeStyle = 'rgba(255,200,80,0.45)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // Brighter head along trail
+      for (let i = Math.max(0, this.trail.length - 2); i < this.trail.length; i++) {
+        const a = ((i + 1) / this.trail.length) * 0.9;
+        ctx.beginPath();
+        ctx.arc(this.trail[i].x, this.trail[i].y, 1.2, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255,230,150,${a})`;
+        ctx.fill();
+      }
+    }
+    // Draw rocket head (bright warm dot with strong glow)
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff';
+    ctx.shadowColor = '#ffaa30';
+    ctx.shadowBlur = 20;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+}
+
+// ── Particle class ─────────────────────────────────────────
+// ── Pre-rendered glow sprite cache ─────────────────────────
+// One offscreen canvas per "glow radius" — drawn once, reused via drawImage.
+// Eliminates per-particle shadowBlur + arc() calls.
+const GLOW_CACHE = new Map();  // key: radius → offscreen canvas
+
+function getGlowSprite(radius) {
+  const key = Math.round(radius);
+  if (GLOW_CACHE.has(key)) return GLOW_CACHE.get(key);
+  const s = key * 6; // larger sprite for cleaner edges
+  const oc = document.createElement('canvas');
+  oc.width = oc.height = s;
+  const octx = oc.getContext('2d');
+  const cx = s / 2, cy = s / 2;
+  // Brighter core, stronger mid-glow, softer edge
+  const grad = octx.createRadialGradient(cx, cy, 0, cx, cy, key);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.15, 'rgba(255,255,255,0.95)');
+  grad.addColorStop(0.4, 'rgba(255,255,255,0.5)');
+  grad.addColorStop(0.7, 'rgba(255,255,255,0.15)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  octx.fillStyle = grad;
+  octx.fillRect(0, 0, s, s);
+  GLOW_CACHE.set(key, oc);
+  return oc;
+}
+
+// ── Particle class (optimized) ─────────────────────────────
+// - No save/restore per draw
+// - No per-frame string parsing (cached color string)
+// - No shadowBlur (uses sprite cache)
+// - Trail drawn as single path (one draw call)
+class Particle {
+  constructor(x, y, vx, vy, colors, shape) {
+    this.x = x;
+    this.y = y;
+    this.vx = vx;
+    this.vy = vy;
+    this.colors = colors;
+    this.alpha = 1;
+    this.shape = shape;
+    this.alive = true;
+    this.trail = [];
+    this.drag = shape === 'willow' ? 0.98 : 0.995;
+    this.size = shape === 'willow' ? 1.5 : 2;
+    // Pre-compute the first color as HSL string (alpha via globalAlpha)
+    const rawColor = colors[0] || 'hsl(0,100%,65%)';
+    this._colorStr = rawColor.replace(/hsl\((\d+),\s*(\d+)%,\s*(\d+)%\)/, 'hsl($1,$2%,$3%)');
+    // Cache the glow sprite for this particle size
+    this._sprite = getGlowSprite(this.size);
+  }
+
+  update(gravity, fadeRate) {
+    if (this.shape === 'willow' || this.alpha > 0.5) {
+      this.trail.push({ x: this.x, y: this.y });
+      if (this.trail.length > 12) this.trail.shift();
+    }
+
+    this.vy += gravity;
+    this.vx *= this.drag;
+    this.vy *= this.drag;
+    this.x += this.vx;
+    this.y += this.vy;
+
+    this.alpha -= fadeRate;
+    if (this.alpha <= 0) {
+      this.alpha = 0;
+      this.alive = false;
+    }
+  }
+
+  // Convert hsl(240, 100%, 65%) → hsla(240, 100%, 65%, a)
+  _hslToA(hslStr, alpha) {
+    const m = hslStr.match(/hsl\((\d+),\s*(\d+)%,\s*(\d+)%\)/);
+    if (!m) return `rgba(255,255,255,${alpha})`;
+    return `hsla(${m[1]},${m[2]}%,${m[3]}%,${alpha})`;
+  }
+
+  draw(ctx) {
+    const a = this.alpha;
+    if (a <= 0) return;
+
+    // Draw trail as a single path (one draw call for all segments)
+    if (this.trail.length > 1) {
+      ctx.beginPath();
+      for (let i = 1; i < this.trail.length; i++) {
+        const ta = (i / this.trail.length) * a * 0.5;
+        ctx.moveTo(this.trail[i].x, this.trail[i].y);
+        ctx.arc(this.trail[i].x, this.trail[i].y, this.size * 0.5, 0, Math.PI * 2);
+      }
+      ctx.fillStyle = `hsla(0,0%,100%,${a * 0.3})`;
+      ctx.fill();
+    }
+
+    // Single-pass rendering: sprite tinted with color at full alpha
+    // Use lighter composite for glow, draw color-tinted sprite directly
+    ctx.globalCompositeOperation = 'lighter';
+
+    // Draw color-tinted sprite in one step:
+    // 1. Draw white sprite at full alpha (bright core glow)
+    ctx.globalAlpha = a;
+    ctx.drawImage(this._sprite, this.x - this._sprite.width / 2, this.y - this._sprite.height / 2);
+
+    // 2. Overlay color tint at reduced alpha for hue (adds color without washing out)
+    ctx.globalAlpha = a * 0.7;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size * 1.2, 0, Math.PI * 2);
+    ctx.fillStyle = this._colorStr;
+    ctx.fill();
+
+    // 3. Bright white-hot center for vivid appearance
+    ctx.globalAlpha = a * 0.6;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size * 0.4, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,1)';
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ── Burst generation ───────────────────────────────────────
+function createBurst(x, y, count, shape) {
+  const colors = pickMultiColor();
+  const result = [];
+
+  for (let i = 0; i < count; i++) {
+    let vx, vy;
+
+    if (shape === 'sphere') {
+      // Uniform radial burst — wider speed range for fuller look
+      const angle = Math.random() * Math.PI * 2;
+      const speed = rand(2.5, 8);
+      vx = Math.cos(angle) * speed;
+      vy = Math.sin(angle) * speed;
+    } else if (shape === 'ring') {
+      // Ring / circle burst — uniform radius for crisp ring
+      const angle = (i / count) * Math.PI * 2 + Math.random() * 0.15;
+      const speed = rand(5.5, 6.5);
+      vx = Math.cos(angle) * speed;
+      vy = Math.sin(angle) * speed;
+    } else if (shape === 'willow') {
+      // Willow: slower upward, heavy drag, long trails
+      const angle = Math.random() * Math.PI * 2;
+      const speed = rand(1.5, 5);
+      vx = Math.cos(angle) * speed * 0.5;
+      vy = Math.sin(angle) * speed * 0.5 - 2.5;  // bias upward
+    } else {
+      // 'random' — choose a shape per particle for variety
+      const subShape = ['sphere', 'ring', 'willow'][Math.floor(Math.random() * 3)];
+      if (subShape === 'ring') {
+        const angle = (i / count) * Math.PI * 2 + Math.random() * 0.15;
+        const speed = rand(5.5, 6.5);
+        vx = Math.cos(angle) * speed;
+        vy = Math.sin(angle) * speed;
+      } else if (subShape === 'willow') {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = rand(1.5, 5);
+        vx = Math.cos(angle) * speed * 0.5;
+        vy = Math.sin(angle * 1) * speed * 0.5 - 2.5;
+      } else {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = rand(2.5, 8);
+        vx = Math.cos(angle) * speed;
+        vy = Math.sin(angle) * speed;
+      }
+    }
+
+    result.push(new Particle(x, y, vx, vy, colors, shape));
+  }
+
+  return result;
+}
+
+// ── Launch a firework ──────────────────────────────────────
+function launchFirework(tx, ty) {
+  // Check particle cap
+  if (particles.length >= MAX_PARTICLES) return;
+
+  const sx = tx + rand(-30, 30);   // slight horizontal spread at bottom
+  const sy = canvas.height;
+  rockets.push(new Rocket(sx, sy, tx, ty));
+}
+
+// ── Auto show logic ────────────────────────────────────────
+function autoLaunch() {
+  const tx = rand(100, canvas.width - 100);
+  const ty = rand(80, canvas.height * 0.45);
+  launchFirework(tx, ty);
+}
+
+// ── Input: click / drag ────────────────────────────────────
+let mouseDown = false;
+let lastAutoLaunch = 0;
+
+canvas.addEventListener('mousedown', (e) => {
+  mouseDown = true;
+  launchFirework(e.clientX, e.clientY);
+});
+canvas.addEventListener('mouseup', () => { mouseDown = false; });
+canvas.addEventListener('mousemove', (e) => {
+  if (mouseDown) {
+    launchFirework(e.clientX, e.clientY);
+  }
+});
+
+// Touch support
+canvas.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  const t = e.touches[0];
+  mouseDown = true;
+  launchFirework(t.clientX, t.clientY);
+}, { passive: false });
+canvas.addEventListener('touchend', () => { mouseDown = false; });
+canvas.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  const t = e.touches[0];
+  launchFirework(t.clientX, t.clientY);
+}, { passive: false });
+
+// ── Control panel buttons ──────────────────────────────────
+elAuto.addEventListener('click', () => {
+  autoOn = !autoOn;
+  elAuto.textContent = `Auto Show: ${autoOn ? 'ON' : 'OFF'}`;
+  elAuto.classList.toggle('active', autoOn);
+});
+
+elClear.addEventListener('click', () => {
+  rockets = [];
+  particles = [];
+});
+
+// ── Main game loop ─────────────────────────────────────────
+function gameLoop(timestamp) {
+  requestAnimationFrame(gameLoop);
+
+  // FPS calculation
+  if (lastTime > 0) {
+    const dt = timestamp - lastTime;
+    fpsAccum += dt;
+    fpsFrames++;
+    if (fpsAccum >= 500) {  // update every 500ms
+      fpsValue = Math.round((fpsFrames / fpsAccum) * 1000);
+      fpsAccum = 0;
+      fpsFrames = 0;
+    }
+  }
+  lastTime = timestamp;
+
+  // ── Background fade (deep trail / motion-blur effect) ──
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = `rgba(2, 1, 5, ${BG_FADE_ALPHA})`;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // ── Auto show ───────────────────────────────────────────
+  if (autoOn) {
+    // Slow down auto-launch if FPS is low
+    const interval = fpsValue < 30 ? 250 : (fpsValue < 45 ? 150 : 80);
+    autoTimer++;
+    if (autoTimer >= interval) {
+      autoLaunch();
+      autoTimer = 0;
+    }
+  }
+
+  // ── Update & draw rockets ───────────────────────────────
+  for (let i = rockets.length - 1; i >= 0; i--) {
+    const r = rockets[i];
+    r.update();
+    r.draw(ctx);
+
+    // Explode when dead
+    if (!r.alive) {
+      const cfg_ = cfg();
+      const shape = cfg_.burstShape === 'random'
+        ? ['sphere', 'ring', 'willow'][randInt(0, 2)]
+        : cfg_.burstShape;
+      const count = cfg_.particlesPerBurst;
+
+      // Respect particle cap
+      const available = MAX_PARTICLES - particles.length;
+      if (available > 0) {
+        const actualCount = Math.min(count, available);
+        const newParticles = createBurst(r.x, r.y, actualCount, shape);
+        particles.push(...newParticles);
+      }
+
+      rockets.splice(i, 1);
+    }
+  }
+
+  // ── Update & draw particles ─────────────────────────────
+  const cfg_ = cfg();
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.update(cfg_.gravity, cfg_.fadeSpeed);
+    p.draw(ctx);
+
+    // Remove dead particles
+    if (!p.alive) {
+      particles.splice(i, 1);
+    }
+  }
+
+  // ── Stats overlay ───────────────────────────────────────
+  elStats.textContent = `FPS: ${fpsValue} | Particles: ${particles.length}`;
+
+  // ── Reset composite for next frame ──────────────────────
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// ── Start the loop ─────────────────────────────────────────
+requestAnimationFrame(gameLoop);
+
+</script>
+</body>
+</html>
